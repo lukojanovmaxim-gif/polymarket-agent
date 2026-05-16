@@ -4,11 +4,20 @@ Polymarket API client.
 Gamma API  (https://gamma-api.polymarket.com) — market discovery and prices, no auth.
 CLOB API   (https://clob.polymarket.com)       — orderbook data, no auth for reads.
 
-All market data is normalized to a flat dict with these keys:
+Gamma API market format (actual):
+  outcomes       — JSON string: '["Yes", "No"]'
+  outcomePrices  — JSON string: '["0.51", "0.49"]'
+  clobTokenIds   — JSON string: '["<yes_token_id>", "<no_token_id>"]'
+  conditionId    — hex condition ID
+  volumeNum      — float volume
+  liquidityNum   — float liquidity
+
+All markets are normalized to a flat dict with these keys:
   id, question, yes_price, no_price, price_sum,
   yes_token_id, no_token_id, volume, volume_24hr,
-  liquidity, end_date, active, closed, tags, spread
+  liquidity, end_date, active, closed, slug, spread
 """
+import json
 import logging
 
 import httpx
@@ -21,36 +30,55 @@ logger = logging.getLogger(__name__)
 
 def _normalize(raw: dict) -> dict | None:
     """Convert a Gamma API market dict to internal format. Returns None for non-binary markets."""
-    tokens = raw.get("tokens") or []
-    yes_tok = next((t for t in tokens if str(t.get("outcome", "")).lower() == "yes"), None)
-    no_tok = next((t for t in tokens if str(t.get("outcome", "")).lower() == "no"), None)
-    if not yes_tok or not no_tok:
+    try:
+        outcomes = json.loads(raw.get("outcomes") or "[]")
+        prices_raw = json.loads(raw.get("outcomePrices") or "[]")
+    except (json.JSONDecodeError, TypeError):
         return None
+
+    if len(outcomes) != 2 or len(prices_raw) != 2:
+        return None
+
+    outcomes_lower = [str(o).lower() for o in outcomes]
+    if "yes" not in outcomes_lower or "no" not in outcomes_lower:
+        return None
+
+    yes_idx = outcomes_lower.index("yes")
+    no_idx  = outcomes_lower.index("no")
 
     try:
-        yes_price = float(yes_tok.get("price") or 0.5)
-        no_price = float(no_tok.get("price") or 0.5)
-    except (TypeError, ValueError):
+        yes_price = float(prices_raw[yes_idx])
+        no_price  = float(prices_raw[no_idx])
+    except (ValueError, IndexError):
         return None
 
-    tags = [t.get("slug", "") for t in (raw.get("tags") or [])]
-    cid = raw.get("condition_id") or raw.get("id", "")
+    # CLOB token IDs (used for orderbook lookups)
+    clob_ids: list[str] = []
+    try:
+        clob_ids = json.loads(raw.get("clobTokenIds") or "[]")
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    yes_token_id = clob_ids[yes_idx] if len(clob_ids) > yes_idx else ""
+    no_token_id  = clob_ids[no_idx]  if len(clob_ids) > no_idx  else ""
+
+    cid = raw.get("conditionId") or raw.get("id", "")
 
     return {
         "id": cid,
         "question": raw.get("question", ""),
         "yes_price": yes_price,
         "no_price": no_price,
-        "yes_token_id": yes_tok.get("token_id", ""),
-        "no_token_id": no_tok.get("token_id", ""),
+        "yes_token_id": yes_token_id,
+        "no_token_id": no_token_id,
         "price_sum": round(yes_price + no_price, 4),
-        "volume": float(raw.get("volume") or 0),
-        "volume_24hr": float(raw.get("volume_24hr") or 0),
-        "liquidity": float(raw.get("liquidity") or 0),
-        "end_date": raw.get("endDate") or raw.get("end_date_iso") or "",
+        "volume": float(raw.get("volumeNum") or raw.get("volume") or 0),
+        "volume_24hr": float(raw.get("volume24hr") or 0),
+        "liquidity": float(raw.get("liquidityNum") or raw.get("liquidity") or 0),
+        "end_date": raw.get("endDate") or raw.get("endDateIso") or "",
         "active": bool(raw.get("active", True)),
         "closed": bool(raw.get("closed", False)),
-        "tags": tags,
+        "slug": raw.get("slug", ""),
         "spread": float(raw.get("spread") or 0),
     }
 
@@ -64,21 +92,14 @@ class PolymarketClient:
         limit: int = 100,
         active: bool = True,
         closed: bool = False,
-        tag_slug: str = "",
         search: str = "",
-        order: str = "volume",
-        ascending: bool = False,
     ) -> list[dict]:
         """Fetch and normalize binary markets from the Gamma API."""
         params: dict = {
             "limit": limit,
             "active": "true" if active else "false",
             "closed": "true" if closed else "false",
-            "order": order,
-            "ascending": "true" if ascending else "false",
         }
-        if tag_slug:
-            params["tag_slug"] = tag_slug
         if search:
             params["_q"] = search
 

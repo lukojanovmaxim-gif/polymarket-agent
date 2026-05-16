@@ -2,9 +2,12 @@
 Polymarket market scanner — runs every 30 seconds.
 
 Fetches markets in three pools so each strategy sees the right data:
-  crypto  — BTC/ETH/crypto tagged markets
-  sports  — sports game markets
-  general — top 100 open markets by volume (broad opportunity scan)
+  general — top 200 open markets by volume (Gamma API default sort)
+  crypto  — subset of general where question contains BTC/ETH keywords
+  sports  — subset of general where question contains sports keywords
+
+Filtering is done locally after fetching the general pool to avoid
+relying on Gamma API tag parameters that may not be supported.
 
 Detects whale activity: YES price swing ≥ WHALE_DELTA in one scan interval.
 """
@@ -21,13 +24,13 @@ logger = logging.getLogger(__name__)
 
 SCAN_INTERVAL_S = 30
 HISTORY_DEPTH = 10
-WHALE_DELTA = 0.05  # 5¢ YES price swing triggers whale alert
+WHALE_DELTA = 0.05   # 5¢ YES price swing triggers whale alert
+GENERAL_LIMIT = 200  # fetch a wide pool and split locally
 
-CATEGORY_TAGS: dict[str, list[str]] = {
-    "crypto":  ["crypto", "bitcoin", "ethereum"],
-    "sports":  ["sports", "nfl", "nba", "mlb", "nhl", "soccer"],
-}
-GENERAL_LIMIT = 100
+CRYPTO_KWS = ("bitcoin", "btc", "ethereum", "eth", "crypto", "solana", "sol")
+SPORTS_KWS = ("nfl", "nba", "mlb", "nhl", "soccer", "mls", "ufc", "nascar",
+              "super bowl", "world series", "stanley cup", "game ", " game",
+              " win ", "beat ", " vs ", "match")
 
 
 @dataclass
@@ -55,7 +58,7 @@ class MarketScanner:
     def __init__(self, client: PolymarketClient, on_whale: WhaleCallback | None = None):
         self._client = client
         self._on_whale = on_whale
-        self._pools: dict[str, list[dict]] = {cat: [] for cat in [*CATEGORY_TAGS, "general"]}
+        self._pools: dict[str, list[dict]] = {"crypto": [], "sports": [], "general": []}
         self._history: dict[str, deque[MarketSnapshot]] = defaultdict(
             lambda: deque(maxlen=HISTORY_DEPTH)
         )
@@ -88,7 +91,7 @@ class MarketScanner:
 
     async def start(self) -> None:
         self._running = True
-        logger.info("MarketScanner started — interval %ds | tags: %s", SCAN_INTERVAL_S, CATEGORY_TAGS)
+        logger.info("MarketScanner started — interval %ds | pool size %d", SCAN_INTERVAL_S, GENERAL_LIMIT)
         while self._running:
             await self._scan()
             await asyncio.sleep(SCAN_INTERVAL_S)
@@ -98,45 +101,29 @@ class MarketScanner:
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
-    async def _fetch_tag_pool(self, category: str, tags: list[str]) -> list[dict]:
-        markets: list[dict] = []
-        seen: set[str] = set()
-        for tag in tags:
-            try:
-                batch = await self._client.get_markets(limit=100, tag_slug=tag)
-                for m in batch:
-                    mid = m.get("id", "")
-                    if mid and mid not in seen:
-                        seen.add(mid)
-                        markets.append(m)
-            except Exception as exc:
-                logger.debug("Scanner: %s/%s skipped: %s", category, tag, exc)
-        return markets
+    @staticmethod
+    def _is_crypto(m: dict) -> bool:
+        q = m.get("question", "").lower()
+        return any(kw in q for kw in CRYPTO_KWS)
+
+    @staticmethod
+    def _is_sports(m: dict) -> bool:
+        q = m.get("question", "").lower()
+        return any(kw in q for kw in SPORTS_KWS)
 
     async def _scan(self) -> None:
         try:
-            category_keys = list(CATEGORY_TAGS.keys())
-            coros = [
-                self._fetch_tag_pool(cat, CATEGORY_TAGS[cat])
-                for cat in category_keys
-            ] + [self._client.get_markets(limit=GENERAL_LIMIT, order="volume")]
+            # Fetch the general pool — split into category sub-pools locally
+            raw = await self._client.get_markets(limit=GENERAL_LIMIT)
+            if not raw:
+                logger.warning("Scanner: Gamma API returned 0 markets")
+                return
 
-            results = await asyncio.gather(*coros, return_exceptions=True)
-
-            new_pools: dict[str, list[dict]] = {}
-            for cat, result in zip(category_keys, results[:-1]):
-                if isinstance(result, Exception):
-                    logger.warning("Scanner: %s pool error: %s", cat, result)
-                    new_pools[cat] = self._pools.get(cat, [])
-                else:
-                    new_pools[cat] = result
-
-            gen = results[-1]
-            if isinstance(gen, Exception):
-                logger.warning("Scanner: general pool error: %s", gen)
-                new_pools["general"] = self._pools.get("general", [])
-            else:
-                new_pools["general"] = gen
+            new_pools: dict[str, list[dict]] = {
+                "general": raw,
+                "crypto":  [m for m in raw if self._is_crypto(m)],
+                "sports":  [m for m in raw if self._is_sports(m)],
+            }
 
             async with self._lock:
                 self._pools = new_pools
