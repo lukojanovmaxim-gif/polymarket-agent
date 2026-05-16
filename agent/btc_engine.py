@@ -258,11 +258,11 @@ class BtcUpDownEngine:
     # ── Gamma API ──────────────────────────────────────────────────────────────
 
     async def _fetch_updown_markets(self, slug_kw: str) -> list[dict]:
+        # _q searches question text, not slug — fetch a large batch and filter locally
         params = {
             "active":    "true",
             "closed":    "false",
-            "_q":        slug_kw,
-            "limit":     50,
+            "limit":     200,
             "order":     "startDate",
             "ascending": "false",
         }
@@ -275,14 +275,13 @@ class BtcUpDownEngine:
             logger.warning("BtcUpDown: Gamma fetch failed for %s: %s", slug_kw, exc)
             return []
 
+        kw = slug_kw.lower()
         result = []
         for raw in raw_list:
+            if kw not in raw.get("slug", "").lower():
+                continue
             m = _normalize(raw)
             if not m or not m["active"] or m["closed"]:
-                continue
-            slug_match = slug_kw.lower() in m.get("slug", "").lower()
-            q_match    = slug_kw.lower() in m.get("question", "").lower()
-            if not slug_match and not q_match:
                 continue
             result.append(m)
         return result
