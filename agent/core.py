@@ -15,7 +15,7 @@ from enum import Enum
 from zoneinfo import ZoneInfo
 
 from agent.arb_engine import CrossArbEngine
-from agent.config import PAPER_BALANCE_INITIAL
+from agent.config import DATA_DIR, PAPER_BALANCE_INITIAL, RESET_ON_START
 from agent.ledger import Ledger
 from agent.market_scanner import MarketScanner, WhaleAlert
 from agent.polymarket_client import PolymarketClient
@@ -38,11 +38,14 @@ class PolyTradingCore:
     def __init__(self, reporter: Reporter) -> None:
         self._reporter = reporter
 
+        if RESET_ON_START:
+            for fname in ("trades.json", "daily_state.json", "fired_arb.json"):
+                (DATA_DIR / fname).unlink(missing_ok=True)
+            logger.info("RESET_ON_START: data files cleared")
+
         self._client  = PolymarketClient()
         self._ledger  = Ledger()
         self._risk    = RiskManager(paper_mode=True)
-
-        self._paper_balance = self._ledger.paper_balance(PAPER_BALANCE_INITIAL)
         self.state: AgentState = AgentState.STOPPED
         self._tasks: list[asyncio.Task] = []
 
@@ -69,12 +72,13 @@ class PolyTradingCore:
         )
 
     async def _get_balance(self) -> float:
-        return self._paper_balance
+        return self._ledger.paper_balance(PAPER_BALANCE_INITIAL)
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def launch(self) -> None:
-        self._risk.start_day(self._paper_balance)
+        balance = self._ledger.paper_balance(PAPER_BALANCE_INITIAL)
+        self._risk.start_day(balance)
 
         self._tasks = [
             self._make_task(self._scanner.start(),      "market-scanner"),
@@ -89,10 +93,10 @@ class PolyTradingCore:
 
         await self._reporter.startup(
             state=self.state,
-            balance=self._paper_balance,
+            balance=balance,
             paper_mode=True,
         )
-        logger.info("PolyTradingCore running | paper=$%.2f", self._paper_balance)
+        logger.info("PolyTradingCore running | paper=$%.2f", balance)
 
     async def shutdown(self) -> None:
         self.state = AgentState.STOPPED
@@ -154,7 +158,7 @@ class PolyTradingCore:
         result = {
             "state": self.state,
             "paper_mode": True,
-            "balance": round(self._paper_balance, 2),
+            "balance": round(self._ledger.paper_balance(PAPER_BALANCE_INITIAL), 2),
             "daily_pnl": round(self._risk.net_pnl, 2),
             "daily_loss_pct": round(self._risk.daily_loss_pct * 100, 1),
             "daily_limit_pct": round(self._risk.max_loss_pct * 100, 1),

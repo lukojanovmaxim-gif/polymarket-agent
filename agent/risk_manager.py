@@ -62,8 +62,6 @@ class RiskManager:
         return self._state.halted
 
     def can_trade(self) -> tuple[bool, str]:
-        if self._paper_mode:
-            return True, ""
         self._maybe_reset()
         if self._state.halted:
             return False, self._state.halt_reason

@@ -15,12 +15,13 @@ Matching: Jaccard keyword similarity on market questions (≥ SIMILARITY_MIN).
 Each (poly_id, kalshi_ticker, direction) tuple is fired at most once per session.
 """
 import asyncio
+import json
 import logging
 import re
 
 import httpx
 
-from agent.config import KALSHI_AGENT_URL
+from agent.config import DATA_DIR, KALSHI_AGENT_URL
 from agent.ledger import Ledger
 from agent.market_scanner import MarketScanner
 from agent.reporter import Reporter
@@ -29,10 +30,12 @@ from agent.risk_manager import RiskManager
 logger = logging.getLogger(__name__)
 
 ARB_THRESHOLD   = 0.95   # combined cost must be below this
-SIMILARITY_MIN  = 0.20   # minimum Jaccard similarity to consider a match
+SIMILARITY_MIN  = 0.55   # minimum Jaccard similarity — high enough to ensure same event
 MAX_BALANCE_PCT = 0.03   # 3% of balance per cross-arb trade
 MIN_TRADE_USD   = 5.0
 POLL_INTERVAL_S = 60
+
+FIRED_SET_FILE = DATA_DIR / "fired_arb.json"
 
 _STOP_WORDS = frozenset({
     "a", "an", "the", "to", "of", "in", "is", "will", "be", "by",
@@ -71,8 +74,8 @@ class CrossArbEngine:
         self._paper_mode = paper_mode
         self._get_state = get_state
         self._get_balance = get_balance
-        self._fired_set: set[tuple[str, str, str]] = set()
-        self._fired: int = 0
+        self._fired_set: set[tuple[str, str, str]] = self._load_fired_set()
+        self._fired: int = len(self._fired_set)
         self._running = False
 
     async def start(self) -> None:
@@ -96,9 +99,29 @@ class CrossArbEngine:
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
+    def _load_fired_set(self) -> set[tuple[str, str, str]]:
+        try:
+            with open(FIRED_SET_FILE) as f:
+                return {tuple(item) for item in json.load(f)}
+        except Exception:
+            return set()
+
+    def _save_fired_set(self) -> None:
+        try:
+            DATA_DIR.mkdir(exist_ok=True)
+            with open(FIRED_SET_FILE, "w") as f:
+                json.dump([list(item) for item in self._fired_set], f)
+        except Exception as exc:
+            logger.warning("CrossArbEngine: could not save fired set: %s", exc)
+
     async def _tick(self) -> None:
         if not KALSHI_AGENT_URL:
             logger.debug("CrossArbEngine: KALSHI_AGENT_URL not set — skipping tick")
+            return
+
+        balance = await self._get_balance()
+        if balance < MIN_TRADE_USD:
+            logger.info("CrossArbEngine: balance $%.2f below minimum — skipping tick", balance)
             return
 
         poly_markets = self._scanner.markets
@@ -142,6 +165,7 @@ class CrossArbEngine:
                     key = (poly_id, kalshi_ticker, "A")
                     if key not in self._fired_set:
                         self._fired_set.add(key)
+                        self._save_fired_set()
                         await self._fire(
                             direction="A", poly_mkt=p_mkt, kalshi_mkt=k_mkt,
                             poly_price=poly_yes, kalshi_price=kalshi_no,
@@ -154,6 +178,7 @@ class CrossArbEngine:
                     key = (poly_id, kalshi_ticker, "B")
                     if key not in self._fired_set:
                         self._fired_set.add(key)
+                        self._save_fired_set()
                         await self._fire(
                             direction="B", poly_mkt=p_mkt, kalshi_mkt=k_mkt,
                             poly_price=poly_no, kalshi_price=kalshi_yes,
