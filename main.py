@@ -141,6 +141,11 @@ async def get_sports_status(request: Request):
     return _core(request)._sports_arb.sports_status()
 
 
+@app.get("/btc")
+async def get_btc_status(request: Request):
+    return _core(request)._btc.btc_status()
+
+
 @app.exception_handler(Exception)
 async def global_error_handler(request: Request, exc: Exception):
     logger.error("Unhandled error: %s", exc)

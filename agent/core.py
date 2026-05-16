@@ -15,6 +15,7 @@ from enum import Enum
 from zoneinfo import ZoneInfo
 
 from agent.arb_engine import CrossArbEngine
+from agent.btc_engine import BtcUpDownEngine
 from agent.config import DATA_DIR, PAPER_BALANCE_INITIAL, RESET_ON_START
 from agent.ledger import Ledger
 from agent.market_scanner import MarketScanner, WhaleAlert
@@ -70,6 +71,13 @@ class PolyTradingCore:
             get_state=lambda: self.state,
             get_balance=self._get_balance,
         )
+        self._btc = BtcUpDownEngine(
+            ledger=self._ledger,
+            risk=self._risk,
+            paper_mode=True,
+            get_state=lambda: self.state,
+            get_balance=self._get_balance,
+        )
 
     async def _get_balance(self) -> float:
         return self._ledger.paper_balance(PAPER_BALANCE_INITIAL)
@@ -84,6 +92,7 @@ class PolyTradingCore:
             self._make_task(self._scanner.start(),      "market-scanner"),
             self._make_task(self._arb.start(),          "arb-engine"),
             self._make_task(self._sports_arb.start(),   "sports-arb"),
+            self._make_task(self._btc.start(),          "btc-updown"),
             asyncio.create_task(
                 self._reporter.run_daily_scheduler(self._build_summary),
                 name="daily-reporter",
@@ -103,6 +112,7 @@ class PolyTradingCore:
         self._scanner.stop()
         self._arb.stop()
         self._sports_arb.stop()
+        self._btc.stop()
         for task in self._tasks:
             task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
