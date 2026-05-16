@@ -35,7 +35,7 @@ class TradeRecord:
     signal_reasoning: str
     news_headline: str
     timestamp: str          # ISO UTC
-    strategy: str = "arb"  # arb | sports
+    strategy: str = "arb"  # arb | sports | cross_arb
     outcome: str = "open"  # open | won | lost | exited_early
     exit_price_cents: int = 0
     pnl_usd: float = 0.0
@@ -164,7 +164,7 @@ class Ledger:
         closed = [t for t in self._trades if t.outcome in ("won", "lost")]
 
         by_strategy: dict[str, Any] = {}
-        for s in ("arb", "sports"):
+        for s in ("arb", "sports", "cross_arb"):
             bucket = [t for t in closed if getattr(t, "strategy", "arb") == s]
             wins   = sum(1 for t in bucket if t.outcome == "won")
             pnl    = sum(t.pnl_usd for t in bucket)

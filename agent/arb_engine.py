@@ -1,42 +1,65 @@
 """
-ArbEngine — buys both sides of BTC markets when YES + NO < $1.00.
+CrossArbEngine — cross-market arbitrage between Polymarket and Kalshi.
 
-On a binary Polymarket market exactly one outcome pays $1.00 per share at
-resolution. If YES price + NO price < $1.00, buying N shares of each side
-costs N × (YES + NO) and is guaranteed to return N × $1.00 — pure risk-free
-profit equal to N × (1 − YES − NO).
+Compares the same binary event across both exchanges. If one platform
+prices YES low and the other prices NO low, buying both sides can cost
+less than $1.00 combined — risk-free profit at resolution.
 
-Strategy:
-  1. Scan the crypto pool every 30 s for BTC-tagged markets
-  2. If price_sum < ARB_THRESHOLD and edge ≥ ARB_MIN_EDGE, enter the trade
-  3. In paper mode: deduct cost from balance and record in ledger as side="arb"
+Case A: poly_yes_price + kalshi_no_price < ARB_THRESHOLD
+  → buy YES on Polymarket + NO on Kalshi
 
-Position sizing: 5 % of balance per arb pair, minimum $5.
+Case B: kalshi_yes_price + poly_no_price < ARB_THRESHOLD
+  → buy YES on Kalshi + NO on Polymarket
+
+Matching: Jaccard keyword similarity on market questions (≥ SIMILARITY_MIN).
+Each (poly_id, kalshi_ticker, direction) tuple is fired at most once per session.
 """
 import asyncio
 import logging
+import re
 
+import httpx
+
+from agent.config import KALSHI_AGENT_URL
 from agent.ledger import Ledger
 from agent.market_scanner import MarketScanner
+from agent.reporter import Reporter
 from agent.risk_manager import RiskManager
 
 logger = logging.getLogger(__name__)
 
-ARB_THRESHOLD = 0.99    # YES + NO must be strictly below this
-ARB_MIN_EDGE  = 0.02    # minimum edge per share ($0.02)
-MAX_BALANCE_PCT = 0.05
+ARB_THRESHOLD   = 0.95   # combined cost must be below this
+SIMILARITY_MIN  = 0.20   # minimum Jaccard similarity to consider a match
+MAX_BALANCE_PCT = 0.03   # 3% of balance per cross-arb trade
 MIN_TRADE_USD   = 5.0
-POLL_INTERVAL_S = 30
+POLL_INTERVAL_S = 60
 
-BTC_KEYWORDS = ("btc", "bitcoin")
+_STOP_WORDS = frozenset({
+    "a", "an", "the", "to", "of", "in", "is", "will", "be", "by",
+    "at", "on", "or", "and", "for", "with", "before", "end", "this",
+    "that", "it", "its", "which", "than", "from", "as", "are",
+    "was", "were", "been", "has", "have", "had",
+})
 
 
-class ArbEngine:
+def _keywords(text: str) -> frozenset[str]:
+    words = re.findall(r"[a-z0-9]+", text.lower())
+    return frozenset(w for w in words if w not in _STOP_WORDS and len(w) > 1)
+
+
+def _jaccard(a: frozenset, b: frozenset) -> float:
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+class CrossArbEngine:
     def __init__(
         self,
         scanner: MarketScanner,
         ledger: Ledger,
         risk: RiskManager,
+        reporter: Reporter,
         paper_mode: bool,
         get_state,
         get_balance,
@@ -44,16 +67,17 @@ class ArbEngine:
         self._scanner = scanner
         self._ledger = ledger
         self._risk = risk
+        self._reporter = reporter
         self._paper_mode = paper_mode
         self._get_state = get_state
         self._get_balance = get_balance
-        self._traded: set[str] = set()
+        self._fired_set: set[tuple[str, str, str]] = set()
         self._fired: int = 0
         self._running = False
 
     async def start(self) -> None:
         self._running = True
-        logger.info("ArbEngine started — polling every %ds", POLL_INTERVAL_S)
+        logger.info("CrossArbEngine started — polling every %ds", POLL_INTERVAL_S)
         while self._running:
             await asyncio.sleep(POLL_INTERVAL_S)
             if self._get_state() == "running":
@@ -63,79 +87,186 @@ class ArbEngine:
         self._running = False
 
     def arb_status(self) -> dict:
+        traded = [f"{p[:12]}/{k}" for p, k, _ in list(self._fired_set)[:10]]
         return {
             "running": self._running,
             "arb_trades_fired": self._fired,
-            "markets_traded": list(self._traded),
+            "markets_traded": traded,
         }
 
+    # ── Internal ──────────────────────────────────────────────────────────────
+
     async def _tick(self) -> None:
-        crypto_markets = self._scanner.markets_for("crypto")
-        candidates = [
-            m for m in crypto_markets
-            if any(kw in m.get("question", "").lower() for kw in BTC_KEYWORDS)
-            and m.get("price_sum", 1.0) < ARB_THRESHOLD
-            and (1.0 - m.get("price_sum", 1.0)) >= ARB_MIN_EDGE
-        ]
-
-        if not candidates:
-            logger.debug("ArbEngine: no BTC arb candidates (crypto pool: %d markets)", len(crypto_markets))
+        if not KALSHI_AGENT_URL:
+            logger.debug("CrossArbEngine: KALSHI_AGENT_URL not set — skipping tick")
             return
 
-        logger.info("ArbEngine: %d BTC arb candidate(s)", len(candidates))
-        for m in candidates:
-            await self._try_arb(m)
-
-    async def _try_arb(self, market: dict) -> None:
-        cid = market.get("id", "")
-        if not cid or cid in self._traded:
+        poly_markets = self._scanner.markets
+        if not poly_markets:
+            logger.debug("CrossArbEngine: Polymarket pool is empty — skipping tick")
             return
 
-        yes_price = market.get("yes_price", 0.5)
-        no_price  = market.get("no_price", 0.5)
-        price_sum = yes_price + no_price
-        edge      = 1.0 - price_sum
+        kalshi_markets = await self._fetch_kalshi()
+        if not kalshi_markets:
+            return
+
+        logger.debug(
+            "CrossArbEngine: comparing %d poly × %d kalshi markets",
+            len(poly_markets), len(kalshi_markets),
+        )
+
+        poly_kw   = [(m, _keywords(m.get("question", ""))) for m in poly_markets]
+        kalshi_kw = [(m, _keywords(m.get("title", "")))    for m in kalshi_markets]
+
+        for p_mkt, p_kw in poly_kw:
+            if not p_kw:
+                continue
+            poly_id  = p_mkt.get("id", "")
+            poly_yes = p_mkt.get("yes_price", 0.5)
+            poly_no  = p_mkt.get("no_price", 0.5)
+
+            for k_mkt, k_kw in kalshi_kw:
+                if not k_kw:
+                    continue
+                sim = _jaccard(p_kw, k_kw)
+                if sim < SIMILARITY_MIN:
+                    continue
+
+                kalshi_ticker = k_mkt.get("ticker", "")
+                kalshi_yes    = k_mkt.get("yes_price", 0.5)
+                kalshi_no     = k_mkt.get("no_price", 0.5)
+
+                # Case A: Poly YES + Kalshi NO
+                combined_a = poly_yes + kalshi_no
+                if combined_a < ARB_THRESHOLD:
+                    key = (poly_id, kalshi_ticker, "A")
+                    if key not in self._fired_set:
+                        self._fired_set.add(key)
+                        await self._fire(
+                            direction="A", poly_mkt=p_mkt, kalshi_mkt=k_mkt,
+                            poly_price=poly_yes, kalshi_price=kalshi_no,
+                            combined=combined_a, edge=ARB_THRESHOLD - combined_a, sim=sim,
+                        )
+
+                # Case B: Kalshi YES + Poly NO
+                combined_b = kalshi_yes + poly_no
+                if combined_b < ARB_THRESHOLD:
+                    key = (poly_id, kalshi_ticker, "B")
+                    if key not in self._fired_set:
+                        self._fired_set.add(key)
+                        await self._fire(
+                            direction="B", poly_mkt=p_mkt, kalshi_mkt=k_mkt,
+                            poly_price=poly_no, kalshi_price=kalshi_yes,
+                            combined=combined_b, edge=ARB_THRESHOLD - combined_b, sim=sim,
+                        )
+
+    async def _fire(
+        self,
+        direction: str,
+        poly_mkt: dict,
+        kalshi_mkt: dict,
+        poly_price: float,
+        kalshi_price: float,
+        combined: float,
+        edge: float,
+        sim: float,
+    ) -> None:
+        poly_id       = poly_mkt.get("id", "")
+        kalshi_ticker = kalshi_mkt.get("ticker", "")
+        poly_q        = poly_mkt.get("question", "")
+        kalshi_q      = kalshi_mkt.get("title", "")
+
+        if direction == "A":
+            action     = "BUY Poly YES + Kalshi NO"
+            poly_side  = "yes"
+            kalshi_side = "no"
+        else:
+            action     = "BUY Kalshi YES + Poly NO"
+            poly_side  = "no"
+            kalshi_side = "yes"
 
         ok, reason = self._risk.can_trade()
         if not ok:
-            logger.warning("ArbEngine: risk block — %s", reason)
+            logger.warning("CrossArbEngine: risk block — %s", reason)
             return
 
         balance   = await self._get_balance()
         max_spend = balance * MAX_BALANCE_PCT
-        shares    = int(max_spend / price_sum)
-        cost_usd  = round(shares * price_sum, 2)
+        shares    = max(1, int(max_spend / combined))
+        cost_usd  = round(shares * combined, 2)
 
-        if shares < 1 or cost_usd < MIN_TRADE_USD:
-            logger.info("ArbEngine: %s — position too small ($%.2f)", cid[:16], cost_usd)
-            return
+        if cost_usd < MIN_TRADE_USD:
+            shares   = max(1, int(MIN_TRADE_USD / combined))
+            cost_usd = round(shares * combined, 2)
 
-        expected_profit = round(shares * edge, 2)
         logger.info(
-            "ArbEngine: FIRE %s | YES=%.3f NO=%.3f sum=%.3f edge=+%.3f | "
-            "%d shares | cost $%.2f | expected profit $%.2f | %s",
-            cid[:16], yes_price, no_price, price_sum, edge,
-            shares, cost_usd, expected_profit,
-            market.get("question", "")[:60],
+            "CrossArbEngine: FIRE dir=%s | poly='%s' | kalshi='%s' | "
+            "poly_price=%.3f kalshi_price=%.3f combined=%.3f edge=+%.3f sim=%.0f%%",
+            direction, poly_q[:50], kalshi_q[:50],
+            poly_price, kalshi_price, combined, edge, sim * 100,
         )
 
-        self._traded.add(cid)
-        self._risk.record_trade(cost_usd)
-
+        reasoning = (
+            f"{action}: Poly {poly_side}={poly_price:.3f} + "
+            f"Kalshi {kalshi_side}={kalshi_price:.3f} = {combined:.3f} < {ARB_THRESHOLD}. "
+            f"Edge: +{edge:.3f}. Similarity: {sim:.0%}."
+        )
         self._ledger.add(
-            event_type="POLYARB",
-            ticker=cid,
-            market_title=market.get("question", cid)[:120],
-            side="arb",
+            event_type="CROSSARB",
+            ticker=f"{poly_id[:16]}/{kalshi_ticker}",
+            market_title=f"[Poly] {poly_q[:60]} / [Kalshi] {kalshi_q[:60]}",
+            side=poly_side,
             count=shares,
-            entry_price_cents=int(price_sum * 100),
+            entry_price_cents=int(combined * 100),
             cost_usd=cost_usd,
-            confidence=round(edge, 3),
-            reasoning=(
-                f"YES={yes_price:.3f} + NO={no_price:.3f} = {price_sum:.3f} < $1.00. "
-                f"Edge: +${edge:.3f}/share. Expected profit: ${expected_profit:.2f}"
-            ),
-            headline=f"BTC arb: YES={yes_price:.3f} NO={no_price:.3f} edge=+{edge:.3f}",
-            strategy="arb",
+            confidence=round(1.0 - combined, 3),
+            reasoning=reasoning,
+            headline=f"Cross-arb {direction}: combined={combined:.3f} edge=+{edge:.3f}",
+            strategy="cross_arb",
         )
+        self._risk.record_trade(cost_usd)
         self._fired += 1
+
+        await self._reporter._post("cross_arb", {
+            "direction": direction,
+            "action": action,
+            "poly_question": poly_q,
+            "kalshi_question": kalshi_q,
+            "poly_price": round(poly_price, 3),
+            "kalshi_price": round(kalshi_price, 3),
+            "combined_cost": round(combined, 3),
+            "edge": round(edge, 3),
+            "similarity": round(sim, 2),
+            "poly_id": poly_id,
+            "kalshi_ticker": kalshi_ticker,
+        })
+
+    async def _fetch_kalshi(self) -> list[dict]:
+        """Fetch Kalshi markets from the Kalshi agent and normalize prices."""
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    f"{KALSHI_AGENT_URL.rstrip('/')}/markets/sample",
+                    params={"n": 500},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+        except Exception as exc:
+            logger.warning("CrossArbEngine: Kalshi fetch failed: %s", exc)
+            return []
+
+        raw = data if isinstance(data, list) else data.get("markets", [])
+        result: list[dict] = []
+        for m in raw:
+            try:
+                yes_ask = m.get("yes_ask") or 50
+                yes_bid = m.get("yes_bid") or 50
+                result.append({
+                    "ticker":    m.get("ticker", ""),
+                    "title":     m.get("title", ""),
+                    "yes_price": yes_ask / 100,
+                    "no_price":  (100 - yes_bid) / 100,
+                })
+            except Exception:
+                continue
+        return result

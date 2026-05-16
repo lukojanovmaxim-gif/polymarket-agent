@@ -14,7 +14,7 @@ from datetime import datetime
 from enum import Enum
 from zoneinfo import ZoneInfo
 
-from agent.arb_engine import ArbEngine
+from agent.arb_engine import CrossArbEngine
 from agent.config import PAPER_BALANCE_INITIAL
 from agent.ledger import Ledger
 from agent.market_scanner import MarketScanner, WhaleAlert
@@ -50,10 +50,11 @@ class PolyTradingCore:
 
         self._scanner = MarketScanner(self._client, on_whale=self._on_whale)
 
-        self._arb = ArbEngine(
+        self._arb = CrossArbEngine(
             scanner=self._scanner,
             ledger=self._ledger,
             risk=self._risk,
+            reporter=self._reporter,
             paper_mode=True,
             get_state=lambda: self.state,
             get_balance=self._get_balance,
