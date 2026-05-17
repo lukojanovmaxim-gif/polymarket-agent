@@ -70,6 +70,10 @@ class BtcUpDownEngine:
             a["pair"]: deque(maxlen=20) for a in ASSETS
         }
 
+        # Last-tick market scan results
+        self._markets_found_last_tick: dict[str, int] = {a["label"]: 0 for a in ASSETS}
+        self._last_market: dict[str, dict | None] = {a["label"]: None for a in ASSETS}
+
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
     async def start(self) -> None:
@@ -91,12 +95,25 @@ class BtcUpDownEngine:
             ]
             for pair, hist in self._price_history.items()
         }
+        def _market_summary(label: str) -> dict | None:
+            m = self._last_market.get(label)
+            if m is None:
+                return None
+            return {
+                "question":  m["question"],
+                "yes_price": m["yes_price"],
+                "no_price":  m["no_price"],
+            }
+
         return {
-            "running":         self._running,
-            "trades_fired":    self._fired,
-            "markets_traded":  [f"{cid[:16]}:{sig}" for cid, sig in list(self._traded)[:20]],
-            "price_snapshots": recent_prices,
-            "trends":          {a["pair"]: self._price_trend(a["pair"]) for a in ASSETS},
+            "running":                 self._running,
+            "trades_fired":            self._fired,
+            "markets_traded":          [f"{cid[:16]}:{sig}" for cid, sig in list(self._traded)[:20]],
+            "price_snapshots":         recent_prices,
+            "trends":                  {a["pair"]: self._price_trend(a["pair"]) for a in ASSETS},
+            "markets_found_last_tick": sum(self._markets_found_last_tick.values()),
+            "last_btc_market":         _market_summary("BTC"),
+            "last_eth_market":         _market_summary("ETH"),
         }
 
     # ── Core tick ──────────────────────────────────────────────────────────────
@@ -115,9 +132,16 @@ class BtcUpDownEngine:
 
         for asset in ASSETS:
             markets = await self._fetch_updown_markets(asset["slug_kw"])
+            self._markets_found_last_tick[asset["label"]] = len(markets)
             if not markets:
                 logger.debug("BtcUpDown: no active markets for %s", asset["slug_kw"])
                 continue
+
+            self._last_market[asset["label"]] = {
+                "question":  markets[0].get("question", ""),
+                "yes_price": markets[0]["yes_price"],
+                "no_price":  markets[0]["no_price"],
+            }
 
             trend = self._price_trend(asset["pair"])
             logger.info(
@@ -284,6 +308,7 @@ class BtcUpDownEngine:
             if not m or not m["active"] or m["closed"]:
                 continue
             result.append(m)
+        logger.info("BtcUpDown: _fetch_updown_markets(%s) → %d active markets", slug_kw, len(result))
         return result
 
     # ── Price data ─────────────────────────────────────────────────────────────
