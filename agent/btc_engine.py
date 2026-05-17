@@ -307,6 +307,8 @@ class BtcUpDownEngine:
             m = _normalize(raw)
             if not m or not m["active"] or m["closed"]:
                 continue
+            if m["restricted"]:
+                logger.debug("BtcUpDown: restricted market included: %s", m["slug"])
             result.append(m)
         logger.info("BtcUpDown: _fetch_updown_markets(%s) → %d active markets", slug_kw, len(result))
         return result

@@ -40,11 +40,16 @@ def _normalize(raw: dict) -> dict | None:
         return None
 
     outcomes_lower = [str(o).lower() for o in outcomes]
-    if "yes" not in outcomes_lower or "no" not in outcomes_lower:
-        return None
 
-    yes_idx = outcomes_lower.index("yes")
-    no_idx  = outcomes_lower.index("no")
+    # Accept yes/no or up/down (btc-updown markets use Up/Down)
+    if "yes" in outcomes_lower and "no" in outcomes_lower:
+        yes_idx = outcomes_lower.index("yes")
+        no_idx  = outcomes_lower.index("no")
+    elif "up" in outcomes_lower and "down" in outcomes_lower:
+        yes_idx = outcomes_lower.index("up")
+        no_idx  = outcomes_lower.index("down")
+    else:
+        return None
 
     try:
         yes_price = float(prices_raw[yes_idx])
@@ -76,10 +81,11 @@ def _normalize(raw: dict) -> dict | None:
         "volume_24hr": float(raw.get("volume24hr") or 0),
         "liquidity": float(raw.get("liquidityNum") or raw.get("liquidity") or 0),
         "end_date": raw.get("endDate") or raw.get("endDateIso") or "",
-        "active": bool(raw.get("active", True)),
-        "closed": bool(raw.get("closed", False)),
-        "slug": raw.get("slug", ""),
-        "spread": float(raw.get("spread") or 0),
+        "active":     bool(raw.get("active", True)),
+        "closed":     bool(raw.get("closed", False)),
+        "restricted": bool(raw.get("restricted", False)),
+        "slug":       raw.get("slug", ""),
+        "spread":     float(raw.get("spread") or 0),
     }
 
 
