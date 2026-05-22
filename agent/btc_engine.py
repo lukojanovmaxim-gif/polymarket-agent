@@ -5,8 +5,8 @@ Fetches active "btc-updown" and "eth-updown" markets from the Gamma API every
 60 seconds (sorted by startDate descending). Three entry signals per market:
 
   1. ARB: YES + NO < 0.97 — buy both sides simultaneously
-  2. CONTRARIAN UP:   YES < 0.35 (market bearish) + asset actually rising → buy YES
-  3. CONTRARIAN DOWN: YES > 0.65 (market bullish) + asset actually falling → buy NO
+  2. CONTRARIAN UP:   YES < 0.40 (market bearish) + asset actually rising → buy YES
+  3. CONTRARIAN DOWN: YES > 0.60 (market bullish) + asset actually falling → buy NO
 
 Asset price trend uses the Coinbase public spot API, comparing the current price
 to the reading from ~5 minutes ago stored in an in-memory rolling buffer.
@@ -32,12 +32,12 @@ COINBASE_SPOT_URL = "https://api.coinbase.com/v2/prices/{pair}/spot"
 
 POLL_INTERVAL_S  = 60
 ARB_THRESHOLD    = 0.97
-CONTRARIAN_LOW   = 0.35    # buy YES when market this bearish but price rising
-CONTRARIAN_HIGH  = 0.65    # buy NO  when market this bullish but price falling
+CONTRARIAN_LOW   = 0.40    # buy YES when market this bearish but price rising
+CONTRARIAN_HIGH  = 0.60    # buy NO  when market this bullish but price falling
 MAX_BALANCE_PCT  = 0.02    # 2% of balance per trade
 MIN_TRADE_USD    = 5.0
 PRICE_LOOKBACK_S = 300     # 5 minutes for trend comparison
-MIN_TREND_MOVE   = 0.001   # 0.1% price move required to declare a trend
+MIN_TREND_MOVE   = 0.0005  # 0.05% price move required to declare a trend
 
 ASSETS = [
     {"slug_kw": "btc-updown", "pair": "BTC-USD", "label": "BTC"},
